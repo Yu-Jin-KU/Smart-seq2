@@ -1,0 +1,129 @@
+# Smart-seq2 RNA-seq analysis pipeline
+# Quantification: Salmon (transcript-level) + tximport
+# Alignment: HISAT2 (for QC / coverage)
+###############################################################################
+
+############################
+# 0. Project configuration
+############################
+
+export PROJECT_DIR=/path/to/project/rnaseq_smartseq2
+export MAMBA_ROOT_PREFIX=$PROJECT_DIR/mamba
+export PATH="$PROJECT_DIR/bin:$PATH"
+
+mkdir -p $PROJECT_DIR/{fastq,ref/{gencode,hisat2},work/{fastqc,salmon,bam,rseqc},results/{qc,counts,plots,tables,logs},scripts}
+
+############################
+# 1. Sample sheet
+############################
+
+cat > $PROJECT_DIR/samples.tsv <<'TSV'
+sample	fraction	condition	rep
+ns_1	nucleus	SL	1
+ns_2	nucleus	SL	2
+n2i_1	nucleus	2iL	1
+n2i_2	nucleus	2iL	2
+cs_1	cytoplasm	SL	1
+cs_2	cytoplasm	SL	2
+c2i_1	cytoplasm	2iL	1
+c2i_2	cytoplasm	2iL	2
+TSV
+
+############################
+# 2. Software environment
+############################
+
+micromamba create -y -n rnaseq \
+  -c conda-forge -c bioconda \
+  python=3.11 r-base=4.3 \
+  fastqc multiqc salmon hisat2 samtools \
+  subread rseqc bedtools pigz parallel deeptools
+
+micromamba activate rnaseq
+
+Rscript - <<'EOF'
+if (!requireNamespace("BiocManager", quietly=TRUE))
+  install.packages("BiocManager")
+BiocManager::install(c(
+  "tximport","DESeq2","EnhancedVolcano",
+  "data.table","tidyverse","pheatmap",
+  "AnnotationDbi","org.Mm.eg.db"
+), ask=FALSE, update=FALSE)
+EOF
+
+############################
+# 3. Reference preparation
+############################
+
+## 3.1 Transcriptome (Salmon)
+cd $PROJECT_DIR/ref/gencode
+wget -nc ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/latest_release/gencode.vM38.transcripts.fa.gz
+wget -nc ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/latest_release/gencode.vM38.annotation.gtf.gz
+gunzip -f *.gz
+
+salmon index -t gencode.vM38.transcripts.fa -i salmon_index -k 31
+
+awk '$3=="transcript"{
+  match($0,/gene_id "([^"]+)"/,g);
+  match($0,/transcript_id "([^"]+)"/,t);
+  print t[1],g[1]
+}' gencode.vM38.annotation.gtf | sort -u > tx2gene.tsv
+
+## 3.2 Genome (HISAT2)
+cd $PROJECT_DIR/ref/hisat2
+wget -nc http://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.fa.gz
+gunzip -f mm39.fa.gz
+hisat2-build mm39.fa mm39
+
+############################
+# 4. FASTQ QC
+############################
+
+cd $PROJECT_DIR
+parallel -j 8 \
+  "fastqc -o work/fastqc fastq/{}_R1.fastq.gz fastq/{}_R2.fastq.gz" \
+  ::: $(cut -f1 samples.tsv | tail -n +2)
+
+multiqc -o results/qc work/fastqc
+
+############################
+# 5. Salmon quantification
+############################
+
+REF=$PROJECT_DIR/ref/gencode/salmon_index
+
+parallel -j 8 '
+  s={};
+  salmon quant -i '"$REF"' -l A \
+    -1 fastq/${s}_R1.fastq.gz \
+    -2 fastq/${s}_R2.fastq.gz \
+    --gcBias -p 8 \
+    -o work/salmon/${s}
+' ::: $(cut -f1 samples.tsv | tail -n +2)
+
+############################
+# 6. HISAT2 alignment (QC / coverage)
+############################
+
+IDX=$PROJECT_DIR/ref/hisat2/mm39
+
+parallel -j 4 '
+  s={};
+  hisat2 -x '"$IDX"' \
+    -1 fastq/${s}_R1.fastq.gz \
+    -2 fastq/${s}_R2.fastq.gz -p 8 | \
+  samtools sort -o work/bam/${s}.bam -
+  samtools index work/bam/${s}.bam
+' ::: $(cut -f1 samples.tsv | tail -n +2)
+
+############################
+# 7. BigWig coverage
+############################
+
+for s in $(cut -f1 samples.tsv | tail -n +2); do
+  bamCoverage -b work/bam/${s}.bam \
+    -o results/qc/${s}.bw \
+    --normalizeUsing RPKM -p 8
+done
+
+echo "Pipeline finished successfully."
