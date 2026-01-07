@@ -1,0 +1,491 @@
+# 1. Server-side Processing (SSH/Linux Commands)
+# 1.1. Login and Set Up Project Environment
+
+# Connect to your analysis server
+ssh username@server.address
+
+# Navigate to your working directory and set up project structure
+export PROJECT_DIR="/path/to/project/subcellular_smartseq2"
+mkdir -p $PROJECT_DIR/{fastq,ref/{gencode,hisat2},work/{fastqc,salmon,bam,rseqc},results/{qc,counts,plots,tables,logs},scripts}
+
+cd $PROJECT_DIR
+# 1.2. Prepare Sample Metadata
+
+# Create sample sheet (2iL condition only, nuclear vs. cytoplasmic)
+cat > $PROJECT_DIR/samples.tsv <<'TSV'
+sample	fraction	rep
+n2i_1	nucleus	1
+n2i_2	nucleus	2
+c2i_1	cytoplasm	1
+c2i_2	cytoplasm	2
+TSV
+
+# Verify sample sheet
+cat $PROJECT_DIR/samples.tsv
+
+# 1.3. Install and Activate Software Environment
+
+# Install miniconda if not available
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh -b -p $PROJECT_DIR/miniconda
+source $PROJECT_DIR/miniconda/bin/activate
+
+# Create and activate analysis environment
+conda create -y -n subcell_rnaseq python=3.11 r-base=4.3
+conda activate subcell_rnaseq
+
+# Install bioinformatics tools via conda channels
+conda install -y -c conda-forge -c bioconda \
+  fastqc multiqc salmon=1.10.0 hisat2 samtools \
+  subread rseqc bedtools deeptools parallel pigz \
+  bioconductor-tximport bioconductor-deseq2 \
+  r-tidyverse r-data.table r-ggpubr r-pheatmap \
+  r-rcolorbrewer bioconductor-annotationdbi
+
+# Verify installations
+salmon --version
+fastqc --version
+R --version
+
+# 1.4. Download and Prepare Reference Files
+
+# Navigate to reference directory
+cd $PROJECT_DIR/ref/gencode
+
+# Download mouse GENCODE M38 transcriptome and annotation
+wget -q ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/latest_release/gencode.vM38.transcripts.fa.gz
+wget -q ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/latest_release/gencode.vM38.annotation.gtf.gz
+
+# Decompress files
+gunzip -f gencode.vM38.transcripts.fa.gz
+gunzip -f gencode.vM38.annotation.gtf.gz
+
+# Build Salmon index for transcript quantification
+echo "Building Salmon index..."
+salmon index -t gencode.vM38.transcripts.fa -i salmon_index_m38 -k 31
+
+# Create transcript-to-gene mapping
+echo "Creating tx2gene mapping..."
+awk '$3=="transcript"{
+  match($0,/gene_id "([^"]+)"/,g);
+  match($0,/transcript_id "([^"]+)"/,t);
+  print t[1] "\t" g[1]
+}' gencode.vM38.annotation.gtf | sort -u > tx2gene_m38.tsv
+
+# Prepare genome reference for HISAT2 alignment
+cd $PROJECT_DIR/ref/hisat2
+wget -q http://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.fa.gz
+gunzip -f mm39.fa.gz
+hisat2-build -p 8 mm39.fa mm39
+
+echo "Reference preparation complete."
+1.5. Quality Control of Raw FASTQ Files
+bash
+cd $PROJECT_DIR
+
+# Run FastQC on all samples in parallel
+echo "Running FastQC..."
+SAMPLES=$(tail -n +2 samples.tsv | cut -f1)
+parallel -j 4 "fastqc -o work/fastqc fastq/{}_R1.fastq.gz fastq/{}_R2.fastq.gz 2> logs/fastqc_{}.log" ::: $SAMPLES
+
+# Aggregate QC reports with MultiQC
+echo "Generating MultiQC report..."
+multiqc -o results/qc -n raw_data_qc_report work/fastqc
+
+# Check for QC issues
+echo "QC summary saved to: results/qc/raw_data_qc_report.html"
+
+# 1.6. Transcript Quantification with Salmon
+
+cd $PROJECT_DIR
+REF_INDEX="$PROJECT_DIR/ref/gencode/salmon_index_m38"
+
+# Run Salmon quantification for all samples
+echo "Running Salmon quantification..."
+for SAMPLE in $SAMPLES; do
+  echo "Processing $SAMPLE..."
+  salmon quant -i $REF_INDEX \
+    -l A \
+    -1 fastq/${SAMPLE}_R1.fastq.gz \
+    -2 fastq/${SAMPLE}_R2.fastq.gz \
+    --gcBias \
+    --validateMappings \
+    -o work/salmon/$SAMPLE \
+    -p 8 \
+    2> logs/salmon_${SAMPLE}.log
+  
+  # Check completion
+  if [ -f "work/salmon/$SAMPLE/quant.sf" ]; then
+    echo "$SAMPLE quantification complete"
+  else
+    echo "ERROR: $SAMPLE quantification failed"
+    exit 1
+  fi
+done
+
+# Create a summary of mapping rates
+echo "Generating mapping statistics..."
+for SAMPLE in $SAMPLES; do
+  MAP_RATE=$(grep "Mapping rate" work/salmon/$SAMPLE/logs/salmon_quant.log | tail -1 | awk '{print $NF}')
+  echo -e "$SAMPLE\t$MAP_RATE"
+done > results/qc/salmon_mapping_stats.tsv
+
+echo "Salmon quantification complete."
+
+# 1.7. Genome Alignment with HISAT2 (for QC and visualization)
+cd $PROJECT_DIR
+GENOME_INDEX="$PROJECT_DIR/ref/hisat2/mm39"
+
+# Align reads to genome for coverage analysis
+echo "Running HISAT2 alignment..."
+for SAMPLE in $SAMPLES; do
+  echo "Aligning $SAMPLE..."
+  
+  hisat2 -x $GENOME_INDEX \
+    -1 fastq/${SAMPLE}_R1.fastq.gz \
+    -2 fastq/${SAMPLE}_R2.fastq.gz \
+    -p 8 \
+    2> work/bam/${SAMPLE}.hisat2.log | \
+    samtools sort -@ 4 -o work/bam/${SAMPLE}.bam -
+  
+  # Index BAM files
+  samtools index work/bam/${SAMPLE}.bam
+  
+  # Generate alignment statistics
+  samtools flagstat work/bam/${SAMPLE}.bam > work/bam/${SAMPLE}.flagstat
+  
+  # Calculate insert size distribution
+  samtools stats work/bam/${SAMPLE}.bam | grep ^IS | cut -f 2-5 > work/bam/${SAMPLE}.insert_size.tsv
+done
+
+echo "Alignment complete."
+
+# 1.8. Generate Coverage Tracks for Visualization
+
+cd $PROJECT_DIR
+
+# Create BigWig coverage files for genome browser
+echo "Generating coverage tracks..."
+for SAMPLE in $SAMPLES; do
+  bamCoverage -b work/bam/${SAMPLE}.bam \
+    -o results/qc/${SAMPLE}_RPKM.bw \
+    --binSize 10 \
+    --normalizeUsing RPKM \
+    --ignoreDuplicates \
+    --minMappingQuality 10 \
+    -p 4 \
+    2> logs/bamCoverage_${SAMPLE}.log
+done
+
+# Generate overall coverage summary
+multiBigwigSummary bins \
+  -b results/qc/*.bw \
+  -o results/qc/coverage_summary.npz \
+  -p 8
+
+echo "Coverage tracks saved to results/qc/"
+1.9. Prepare Data for R Analysis
+bash
+cd $PROJECT_DIR
+
+# Create directory for R input files
+mkdir -p results/r_analysis
+
+# Copy essential files for R analysis
+cp samples.tsv results/r_analysis/
+cp ref/gencode/tx2gene_m38.tsv results/r_analysis/
+
+# Create a metadata file with full paths for tximport
+echo "sample fraction rep path" > results/r_analysis/salmon_paths.tsv
+for SAMPLE in $SAMPLES; do
+  FRACTION=$(grep $SAMPLE samples.tsv | cut -f2)
+  REP=$(grep $SAMPLE samples.tsv | cut -f3)
+  echo "$SAMPLE $FRACTION $REP $PROJECT_DIR/work/salmon/$SAMPLE/quant.sf" >> results/r_analysis/salmon_paths.tsv
+done
+
+# Compress logs
+tar -czf logs.tar.gz logs/
+echo "Server-side processing complete. Data ready for R analysis."
+
+
+
+
+
+
+# 2. Downstream Analysis in R
+# 2.1. Setup R Environment
+
+# Load required libraries
+library(tximport)
+library(DESeq2)
+library(tidyverse)
+library(data.table)
+library(pheatmap)
+library(ggpubr)
+library(RColorBrewer)
+library(AnnotationDbi)
+
+# Set project directories
+proj_dir <- "/path/to/project/subcellular_smartseq2"
+out_dir <- file.path(proj_dir, "results/figures")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Set color schemes
+fraction_pal <- c("nucleus" = "#D62728", "cytoplasm" = "#1F77B4")
+biotype_pal <- c(
+  "mRNA" = "#7F7F7F",
+  "lncRNA" = "#D62728",
+  "miRNA" = "#FF7F0E",
+  "snoRNA\n(host-pre-mRNA)" = "#1F77B4",
+  "snRNA\n(host-pre-mRNA)" = "#2CA02C"
+)
+
+# Load sample metadata
+samples <- fread(file.path(proj_dir, "results/r_analysis/samples.tsv"))
+samples$fraction <- factor(samples$fraction, levels = c("nucleus", "cytoplasm"))
+rownames(samples) <- samples$sample
+
+# Load transcript-to-gene mapping
+tx2gene <- fread(file.path(proj_dir, "results/r_analysis/tx2gene_m38.tsv"),
+                 col.names = c("transcript_id", "gene_id"))
+
+# Remove version numbers
+tx2gene[, gene_id := sub("\\..*", "", gene_id)]
+tx2gene[, transcript_id := sub("\\..*", "", transcript_id)]
+
+# 2.2. Import Salmon Quantifications with tximport
+
+# Get paths to quant.sf files
+salmon_files <- file.path(proj_dir, "work/salmon", samples$sample, "quant.sf")
+names(salmon_files) <- samples$sample
+
+# Check if all files exist
+if(!all(file.exists(salmon_files))) {
+  stop("Missing Salmon output files. Check paths.")
+}
+
+# Import with tximport
+txi <- tximport(files = salmon_files,
+                type = "salmon",
+                tx2gene = tx2gene,
+                countsFromAbundance = "lengthScaledTPM",
+                ignoreTxVersion = TRUE,
+                ignoreAfterBar = TRUE)
+
+# Assign sample names
+colnames(txi$counts) <- colnames(txi$abundance) <- samples$sample
+
+# Save imported data
+saveRDS(txi, file.path(proj_dir, "results/r_analysis/txi_object.rds"))
+
+# 2.3. Create DESeq2 Dataset and Perform Differential Expression
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromTximport(txi,
+                                colData = samples,
+                                design = ~ fraction)
+
+# Pre-filter lowly expressed genes
+keep <- rowSums(counts(dds) >= 10) >= 2
+dds <- dds[keep, ]
+cat(paste("Retained", nrow(dds), "genes after filtering\n"))
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Extract results: nuclear vs cytoplasmic
+res <- results(dds,
+               contrast = c("fraction", "nucleus", "cytoplasm"),
+               alpha = 0.05,
+               lfcThreshold = 0)
+
+# Annotate results with gene information
+# Load gene annotations (example using biomaRt - adjust for your organism)
+library(biomaRt)
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+gene_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "gene_biotype"),
+                   filters = "ensembl_gene_id",
+                   values = rownames(res),
+                   mart = mart)
+
+# Merge with results
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_info, by = c("gene_id" = "ensembl_gene_id")) %>%
+  mutate(display_type = case_when(
+    gene_biotype == "protein_coding" ~ "mRNA",
+    gene_biotype == "lncRNA" ~ "lncRNA",
+    gene_biotype == "miRNA" ~ "miRNA",
+    gene_biotype == "snoRNA" ~ "snoRNA\n(host-pre-mRNA)",
+    gene_biotype == "snRNA" ~ "snRNA\n(host-pre-mRNA)",
+    TRUE ~ "Other"
+  ))
+
+# Save results
+write.csv(res_df, 
+          file.path(proj_dir, "results/tables/deseq2_results_nucleus_vs_cytoplasm.csv"),
+          row.names = FALSE)
+
+# 2.4. Generate Figure 2A: Sample Distance Heatmap
+
+# Variance stabilizing transformation
+vsd <- vst(dds, blind = TRUE)
+
+# Calculate sample distances
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+# Create heatmap
+pdf(file.path(out_dir, "Fig2A_sample_distance_heatmap.pdf"), width = 6, height = 5)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         annotation_col = data.frame(Fraction = samples$fraction, 
+                                     row.names = samples$sample),
+         annotation_colors = list(Fraction = fraction_pal),
+         color = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+         main = "Sample-to-Sample Distances",
+         fontsize = 10,
+         cellwidth = 30,
+         cellheight = 30)
+dev.off()
+
+#2.5. Generate Figure 2B: Marker Gene Heatmap
+
+# Define marker genes
+nuclear_markers <- c("Malat1", "Neat1", "Sfpq", "Xist", "Nono", "Pnrd")
+cytoplasmic_markers <- c("Gapdh", "Actb", "Pgk1", "Ldha", "Aldoa", "Pkm")
+selected_markers <- c(nuclear_markers, cytoplasmic_markers)
+
+# Extract TPM values for marker genes
+tpm_matrix <- txi$abundance
+gene_names <- res_df$external_gene_name[match(rownames(tpm_matrix), res_df$gene_id)]
+rownames(tpm_matrix) <- ifelse(is.na(gene_names), rownames(tpm_matrix), gene_names)
+
+# Subset to marker genes
+marker_tpm <- tpm_matrix[rownames(tpm_matrix) %in% selected_markers, ]
+marker_tpm <- marker_tpm[order(factor(rownames(marker_tpm), 
+                                       levels = selected_markers)), ]
+
+# Calculate Z-scores
+marker_zscore <- t(scale(t(log2(marker_tpm + 1))))
+
+# Create annotation for gene groups
+gene_groups <- data.frame(
+  Marker_Type = rep(c("Nuclear", "Cytoplasmic"), 
+                    c(length(nuclear_markers), length(cytoplasmic_markers))),
+  row.names = selected_markers
+)
+
+# Generate heatmap
+pdf(file.path(out_dir, "Fig2B_marker_heatmap.pdf"), width = 6, height = 7)
+pheatmap(marker_zscore,
+         cluster_rows = FALSE,
+         cluster_cols = TRUE,
+         annotation_row = gene_groups,
+         annotation_col = data.frame(Fraction = samples$fraction,
+                                     row.names = samples$sample),
+         annotation_colors = list(Fraction = fraction_pal,
+                                  Marker_Type = c(Nuclear = "#D62728", 
+                                                  Cytoplasmic = "#1F77B4")),
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         show_colnames = TRUE,
+         main = "Marker Gene Expression (Z-score)",
+         fontsize_row = 9,
+         fontsize_col = 9)
+dev.off()
+
+# 2.6. Generate Figure 2C: Marker Gene Boxplot
+
+# Prepare data for boxplot
+marker_box_data <- res_df %>%
+  filter(external_gene_name %in% selected_markers) %>%
+  mutate(group = ifelse(external_gene_name %in% nuclear_markers, 
+                        "Nuclear Markers", "Cytoplasmic Markers"),
+         group = factor(group, levels = c("Nuclear Markers", "Cytoplasmic Markers")))
+
+# Create boxplot
+p_boxplot <- ggplot(marker_box_data, aes(x = group, y = log2FoldChange)) +
+  geom_boxplot(aes(fill = group), width = 0.6, alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = group), width = 0.15, size = 3, shape = 19, alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40", size = 0.8) +
+  stat_compare_means(method = "t.test", 
+                     label = "p.format",
+                     label.y = max(marker_box_data$log2FoldChange) * 1.1,
+                     size = 4) +
+  scale_fill_manual(values = c("Nuclear Markers" = "#D62728", 
+                               "Cytoplasmic Markers" = "#1F77B4")) +
+  scale_color_manual(values = c("Nuclear Markers" = "#D62728", 
+                                "Cytoplasmic Markers" = "#1F77B4")) +
+  labs(title = "Marker Gene Enrichment Validation",
+       x = "",
+       y = expression(Log[2]~"Fold Change (Nuclear/Cytoplasmic)")) +
+  theme_pubr(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+# Save plot
+ggsave(file.path(out_dir, "Fig2C_marker_boxplot.pdf"),
+       p_boxplot, width = 6, height = 6, dpi = 300)
+
+# 2.7. Generate Figure 2D: Biotype Violin Plot
+
+# Filter for biotypes of interest
+biotypes_of_interest <- c("mRNA", "lncRNA", "miRNA", 
+                          "snoRNA\n(host-pre-mRNA)", "snRNA\n(host-pre-mRNA)")
+
+violin_data <- res_df %>%
+  filter(display_type %in% biotypes_of_interest) %>%
+  mutate(display_type = factor(display_type, levels = biotypes_of_interest))
+
+# Create violin plot
+p_violin <- ggplot(violin_data, aes(x = display_type, y = log2FoldChange)) +
+  geom_violin(aes(fill = display_type), alpha = 0.7, trim = FALSE) +
+  geom_boxplot(width = 0.15, fill = "white", alpha = 0.8, outlier.shape = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40", size = 0.8) +
+  stat_summary(fun = median, geom = "point", size = 3, color = "black") +
+  scale_fill_manual(values = biotype_pal) +
+  labs(title = "Global RNA Enrichment by Biotype",
+       x = "",
+       y = expression(Log[2]~"Fold Change (Nuclear/Cytoplasmic)")) +
+  theme_pubr(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save plot
+ggsave(file.path(out_dir, "Fig2D_biotype_violin.pdf"),
+       p_violin, width = 8, height = 6, dpi = 300)
+
+# 2.8. Generate Supplementary Figure 1: MA Plot
+
+# Prepare data for MA plot
+ma_data <- res_df %>%
+  filter(display_type %in% biotypes_of_interest) %>%
+  mutate(significant = padj < 0.05 & abs(log2FoldChange) > 1)
+
+# Create MA plot
+p_ma <- ggplot(ma_data, aes(x = log10(baseMean), y = log2FoldChange)) +
+  geom_point(aes(color = display_type, alpha = significant), size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dotted", color = "gray60") +
+  scale_color_manual(values = biotype_pal) +
+  scale_alpha_manual(values = c("TRUE" = 0.8, "FALSE" = 0.3)) +
+  labs(title = "MA Plot: Nuclear vs Cytoplasmic Expression",
+       x = expression(Log[10]~"Mean Expression"),
+       y = expression(Log[2]~"Fold Change (Nuclear/Cytoplasmic)")) +
+  theme_pubr(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.title = element_blank())
+
+# Save plot
+ggsave(file.path(proj_dir, "results/figures/FigS1_MA_plot.pdf"),
+       p_ma, width = 9, height = 6, dpi = 300)
+
+# Generate session info for reproducibility
+sink(file.path(proj_dir, "results/r_analysis/session_info.txt"))
+sessionInfo()
+sink()
+
+cat("R analysis complete. All figures saved to:", out_dir, "\n")
